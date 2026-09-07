@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Upload, Image as ImageIcon, Settings2, Download, Copy } from 'lucide-react';
+import { Upload, Image as ImageIcon, Settings2, Download, Copy, RotateCw, Check } from 'lucide-react';
 
 const DENSITY_CHARS = ' .:-=+*#%@';
 const DENSITY_CHARS_REVERSED = '@%#*+=-:. ';
@@ -10,6 +10,8 @@ export default function App() {
   const [resolution, setResolution] = useState<number>(120); // Characters wide
   const [invert, setInvert] = useState<boolean>(false);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const [rotation, setRotation] = useState<number>(0);
+  const [isCopied, setIsCopied] = useState<boolean>(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -34,16 +36,33 @@ export default function App() {
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
       if (!ctx) return;
 
+      // Create a temporary canvas to handle rotation
+      const tempCanvas = document.createElement('canvas');
+      const tCtx = tempCanvas.getContext('2d');
+      if (!tCtx) return;
+
+      if (rotation === 90 || rotation === 270) {
+        tempCanvas.width = img.height;
+        tempCanvas.height = img.width;
+      } else {
+        tempCanvas.width = img.width;
+        tempCanvas.height = img.height;
+      }
+
+      tCtx.translate(tempCanvas.width / 2, tempCanvas.height / 2);
+      tCtx.rotate((rotation * Math.PI) / 180);
+      tCtx.drawImage(img, -img.width / 2, -img.height / 2);
+
       // Calculate new dimensions keeping aspect ratio
       // ASCII characters are roughly twice as tall as they are wide in standard monospace fonts
       const charWidth = resolution;
-      const aspect = img.height / img.width;
+      const aspect = tempCanvas.height / tempCanvas.width;
       const charHeight = Math.floor(charWidth * aspect * 0.5);
 
       canvas.width = charWidth;
       canvas.height = charHeight;
 
-      ctx.drawImage(img, 0, 0, charWidth, charHeight);
+      ctx.drawImage(tempCanvas, 0, 0, charWidth, charHeight);
       
       const imageData = ctx.getImageData(0, 0, charWidth, charHeight);
       const data = imageData.data;
@@ -73,7 +92,7 @@ export default function App() {
       setIsProcessing(false);
     };
     img.src = imageSrc;
-  }, [imageSrc, resolution, invert]);
+  }, [imageSrc, resolution, invert, rotation]);
 
   useEffect(() => {
     if (imageSrc) {
@@ -82,7 +101,53 @@ export default function App() {
   }, [convertToAscii]);
 
   const copyToClipboard = () => {
-    navigator.clipboard.writeText(asciiArt);
+    navigator.clipboard.writeText(asciiArt).then(() => {
+      setIsCopied(true);
+      setTimeout(() => setIsCopied(false), 2000);
+    });
+  };
+
+  const exportAsImage = (format: 'png' | 'jpeg') => {
+    if (!asciiArt) return;
+
+    const lines = asciiArt.split('\n');
+    const numRows = lines.length;
+    if (numRows === 0) return;
+    
+    const maxCols = lines.reduce((max, line) => Math.max(max, line.length), 0);
+    
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const fontSize = 10;
+    const lineHeight = 10;
+    ctx.font = `${fontSize}px monospace`;
+    
+    const charWidth = ctx.measureText('M').width;
+    
+    const padding = 24;
+    canvas.width = (maxCols * charWidth) + (padding * 2);
+    canvas.height = (numRows * lineHeight) + (padding * 2);
+    
+    ctx.font = `${fontSize}px monospace`;
+    ctx.textBaseline = 'top';
+    
+    ctx.fillStyle = '#09090b'; // zinc-950
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    
+    ctx.fillStyle = '#d4d4d8'; // zinc-300
+    lines.forEach((line, index) => {
+      ctx.fillText(line, padding, padding + (index * lineHeight));
+    });
+    
+    const mimeType = format === 'jpeg' ? 'image/jpeg' : 'image/png';
+    const dataUrl = canvas.toDataURL(mimeType, 0.9);
+    
+    const link = document.createElement('a');
+    link.download = `ascii-art.${format === 'jpeg' ? 'jpg' : 'png'}`;
+    link.href = dataUrl;
+    link.click();
   };
 
   return (
@@ -128,6 +193,17 @@ export default function App() {
               </h3>
               
               <div className="space-y-3">
+                <div className="flex items-center justify-between p-3 bg-zinc-950 rounded-lg border border-zinc-800">
+                  <span className="text-sm text-zinc-400 select-none">Orientation</span>
+                  <button 
+                    onClick={() => setRotation(r => (r + 90) % 360)}
+                    className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-md flex items-center gap-2 transition-colors text-sm font-medium cursor-pointer"
+                  >
+                    <RotateCw className="w-4 h-4" />
+                    Rotate 90°
+                  </button>
+                </div>
+
                 <label className="flex flex-col gap-2">
                   <div className="flex justify-between text-sm">
                     <span className="text-zinc-400">Resolution (Width)</span>
@@ -160,13 +236,35 @@ export default function App() {
             </div>
             
             {asciiArt && (
-               <button 
-                onClick={copyToClipboard}
-                className="w-full flex items-center justify-center gap-2 py-2.5 bg-zinc-100 text-zinc-900 rounded-lg font-medium hover:bg-white transition-colors"
-               >
-                 <Copy className="w-4 h-4" />
-                 Copy ASCII Art
-               </button>
+               <div className="space-y-2">
+                 <button 
+                  onClick={copyToClipboard}
+                  className={`w-full flex items-center justify-center gap-2 py-2.5 rounded-lg font-medium transition-colors cursor-pointer ${
+                    isCopied 
+                      ? 'bg-green-500 text-white hover:bg-green-600' 
+                      : 'bg-zinc-100 text-zinc-900 hover:bg-white'
+                  }`}
+                 >
+                   {isCopied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                   {isCopied ? 'Copied!' : 'Copy ASCII Art'}
+                 </button>
+                 <div className="flex gap-2">
+                   <button 
+                    onClick={() => exportAsImage('png')}
+                    className="flex-1 flex items-center justify-center gap-2 py-2.5 bg-zinc-800 text-zinc-200 hover:bg-zinc-700 rounded-lg font-medium transition-colors cursor-pointer text-sm"
+                   >
+                     <Download className="w-4 h-4" />
+                     PNG
+                   </button>
+                   <button 
+                    onClick={() => exportAsImage('jpeg')}
+                    className="flex-1 flex items-center justify-center gap-2 py-2.5 bg-zinc-800 text-zinc-200 hover:bg-zinc-700 rounded-lg font-medium transition-colors cursor-pointer text-sm"
+                   >
+                     <Download className="w-4 h-4" />
+                     JPG
+                   </button>
+                 </div>
+               </div>
             )}
           </div>
         </div>
@@ -182,15 +280,17 @@ export default function App() {
              <span className="text-xs font-mono text-zinc-500">output.txt</span>
           </div>
           
-          <div className="flex-1 overflow-auto p-4 md:p-8 flex items-center justify-center bg-black">
+          <div className="flex-1 overflow-auto bg-black relative">
             {isProcessing ? (
-              <div className="text-zinc-500 animate-pulse font-mono text-sm">Processing image...</div>
+              <div className="absolute inset-0 flex items-center justify-center text-zinc-500 animate-pulse font-mono text-sm">Processing image...</div>
             ) : asciiArt ? (
-              <pre className="font-mono text-[5px] leading-[5px] md:text-[6px] md:leading-[6px] text-zinc-300 whitespace-pre">
-                {asciiArt}
-              </pre>
+              <div className="w-fit min-h-full flex items-center p-4 md:p-8 mx-auto">
+                <pre className="font-mono text-[5px] leading-[5px] md:text-[6px] md:leading-[6px] text-zinc-300 whitespace-pre">
+                  {asciiArt}
+                </pre>
+              </div>
             ) : (
-              <div className="text-zinc-600 font-mono text-sm flex flex-col items-center gap-2">
+              <div className="absolute inset-0 flex flex-col items-center justify-center text-zinc-600 font-mono text-sm gap-2">
                 <span>[ No image loaded ]</span>
                 <span className="text-xs text-zinc-700">Upload an image to generate ASCII art</span>
               </div>
