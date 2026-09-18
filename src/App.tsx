@@ -1,5 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Upload, Image as ImageIcon, Settings2, Download, Copy, RotateCw, Check } from 'lucide-react';
+// @ts-ignore
+import { parseGIF, decompressFrames } from 'gifuct-js';
+import { GIFEncoder, quantize, applyPalette } from 'gifenc';
 
 const DENSITY_CHARS = ' .:-=+*#%@';
 const DENSITY_CHARS_REVERSED = '@%#*+=-:. ';
@@ -12,6 +15,10 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [rotation, setRotation] = useState<number>(0);
   const [isCopied, setIsCopied] = useState<boolean>(false);
+  const [asciiFrames, setAsciiFrames] = useState<{ascii: string, delay: number}[]>([]);
+  const [currentFrameIdx, setCurrentFrameIdx] = useState<number>(0);
+  const [isPlaying, setIsPlaying] = useState<boolean>(true);
+  const [isExporting, setIsExporting] = useState<boolean>(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -25,10 +32,123 @@ export default function App() {
     }
   };
 
-  const convertToAscii = useCallback(() => {
+  const convertToAscii = useCallback(async () => {
     if (!imageSrc || !canvasRef.current) return;
     
     setIsProcessing(true);
+    setAsciiFrames([]);
+    setCurrentFrameIdx(0);
+
+    const chars = invert ? DENSITY_CHARS_REVERSED : DENSITY_CHARS;
+    const isGif = imageSrc.startsWith('data:image/gif') || imageSrc.toLowerCase().endsWith('.gif');
+
+    if (isGif) {
+      try {
+        const response = await fetch(imageSrc);
+        const buffer = await response.arrayBuffer();
+        const gif = parseGIF(buffer);
+        const framesData = decompressFrames(gif, true);
+
+        const canvas = canvasRef.current!;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (!ctx) return;
+
+        const gifCanvas = document.createElement('canvas');
+        const gifCtx = gifCanvas.getContext('2d', { willReadFrequently: true });
+        const patchCanvas = document.createElement('canvas');
+        const patchCtx = patchCanvas.getContext('2d');
+
+        if (!gifCtx || !patchCtx) return;
+
+        const generatedFrames: { ascii: string; delay: number }[] = [];
+        let patchImageData: ImageData | null = null;
+        let previousCanvasData: ImageData | null = null;
+
+        for (let i = 0; i < framesData.length; i++) {
+          const frame = framesData[i];
+
+          if (i === 0) {
+            gifCanvas.width = frame.dims.width;
+            gifCanvas.height = frame.dims.height;
+          }
+
+          if (!patchImageData || patchCanvas.width !== frame.dims.width || patchCanvas.height !== frame.dims.height) {
+            patchCanvas.width = frame.dims.width;
+            patchCanvas.height = frame.dims.height;
+            patchImageData = patchCtx.createImageData(frame.dims.width, frame.dims.height);
+          }
+
+          if (frame.disposalType === 3) {
+             previousCanvasData = gifCtx.getImageData(0, 0, gifCanvas.width, gifCanvas.height);
+          }
+
+          patchImageData.data.set(frame.patch);
+          patchCtx.putImageData(patchImageData, 0, 0);
+
+          gifCtx.drawImage(patchCanvas, frame.dims.left, frame.dims.top);
+
+          // Rotate and resize
+          const rotatedCanvas = document.createElement('canvas');
+          const rCtx = rotatedCanvas.getContext('2d', { willReadFrequently: true });
+          if (!rCtx) continue;
+
+          if (rotation === 90 || rotation === 270) {
+            rotatedCanvas.width = gifCanvas.height;
+            rotatedCanvas.height = gifCanvas.width;
+          } else {
+            rotatedCanvas.width = gifCanvas.width;
+            rotatedCanvas.height = gifCanvas.height;
+          }
+
+          rCtx.translate(rotatedCanvas.width / 2, rotatedCanvas.height / 2);
+          rCtx.rotate((rotation * Math.PI) / 180);
+          rCtx.drawImage(gifCanvas, -gifCanvas.width / 2, -gifCanvas.height / 2);
+
+          const charWidth = resolution;
+          const aspect = rotatedCanvas.height / rotatedCanvas.width;
+          const charHeight = Math.floor(charWidth * aspect * 0.5);
+
+          canvas.width = charWidth;
+          canvas.height = charHeight;
+
+          ctx.drawImage(rotatedCanvas, 0, 0, charWidth, charHeight);
+          const imageData = ctx.getImageData(0, 0, charWidth, charHeight);
+          const data = imageData.data;
+          
+          let ascii = '';
+          for (let j = 0; j < data.length; j += 4) {
+            const r = data[j];
+            const g = data[j + 1];
+            const b = data[j + 2];
+            const brightness = (0.299 * r + 0.587 * g + 0.114 * b);
+            const charIndex = Math.floor((brightness / 255) * (chars.length - 1));
+            ascii += chars[charIndex];
+            if (((j / 4) + 1) % charWidth === 0) {
+              ascii += '\n';
+            }
+          }
+          
+          generatedFrames.push({ ascii, delay: Math.max(frame.delay || 100, 20) });
+
+          if (frame.disposalType === 2) {
+            gifCtx.clearRect(frame.dims.left, frame.dims.top, frame.dims.width, frame.dims.height);
+          } else if (frame.disposalType === 3 && previousCanvasData) {
+            gifCtx.putImageData(previousCanvasData, 0, 0);
+          }
+        }
+
+        setAsciiFrames(generatedFrames);
+        if (generatedFrames.length > 0) {
+          setAsciiArt(generatedFrames[0].ascii);
+        }
+        setIsProcessing(false);
+        return;
+      } catch (err) {
+        console.error("Error processing GIF:", err);
+      }
+    }
+
+    // Process as static image
     const img = new Image();
     img.crossOrigin = 'Anonymous';
     img.onload = () => {
@@ -89,10 +209,24 @@ export default function App() {
       }
       
       setAsciiArt(ascii);
+      setAsciiFrames([{ ascii, delay: 0 }]);
       setIsProcessing(false);
     };
     img.src = imageSrc;
   }, [imageSrc, resolution, invert, rotation]);
+
+  useEffect(() => {
+    let timeoutId: NodeJS.Timeout;
+    if (asciiFrames.length > 1 && isPlaying && !isProcessing) {
+      const frame = asciiFrames[currentFrameIdx];
+      setAsciiArt(frame.ascii);
+      
+      timeoutId = setTimeout(() => {
+        setCurrentFrameIdx((prev) => (prev + 1) % asciiFrames.length);
+      }, frame.delay);
+    }
+    return () => clearTimeout(timeoutId);
+  }, [asciiFrames, currentFrameIdx, isPlaying, isProcessing]);
 
   useEffect(() => {
     if (imageSrc) {
@@ -148,6 +282,75 @@ export default function App() {
     link.download = `ascii-art.${format === 'jpeg' ? 'jpg' : 'png'}`;
     link.href = dataUrl;
     link.click();
+  };
+
+  const exportAsGif = async () => {
+    if (asciiFrames.length === 0) return;
+    setIsExporting(true);
+
+    // Yield to allow UI to show "Exporting..." state
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    try {
+      const lines = asciiFrames[0].ascii.split('\n');
+      const numRows = lines.length;
+      const maxCols = lines.reduce((max, line) => Math.max(max, line.length), 0);
+      
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) return;
+      
+      const fontSize = 10;
+      const lineHeight = 10;
+      ctx.font = `${fontSize}px monospace`;
+      const charWidth = ctx.measureText('M').width;
+      
+      const padding = 24;
+      const width = Math.ceil((maxCols * charWidth) + (padding * 2));
+      const height = (numRows * lineHeight) + (padding * 2);
+      
+      canvas.width = width;
+      canvas.height = height;
+      
+      const gif = new GIFEncoder();
+      
+      for (const frame of asciiFrames) {
+        ctx.fillStyle = '#09090b';
+        ctx.fillRect(0, 0, width, height);
+        
+        ctx.fillStyle = '#d4d4d8';
+        ctx.font = `${fontSize}px monospace`;
+        ctx.textBaseline = 'top';
+        
+        const frameLines = frame.ascii.split('\n');
+        frameLines.forEach((line, index) => {
+          ctx.fillText(line, padding, padding + (index * lineHeight));
+        });
+        
+        const { data } = ctx.getImageData(0, 0, width, height);
+        
+        // Quantize colors (since we use solid background and text, 256 colors are enough)
+        const palette = quantize(data, 256);
+        const index = applyPalette(data, palette);
+        
+        gif.writeFrame(index, width, height, { palette, delay: frame.delay });
+      }
+      
+      gif.finish();
+      const buffer = gif.bytes();
+      const blob = new Blob([buffer], { type: 'image/gif' });
+      const url = URL.createObjectURL(blob);
+      
+      const link = document.createElement('a');
+      link.download = 'ascii-animated.gif';
+      link.href = url;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch(e) {
+      console.error(e);
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   return (
@@ -232,6 +435,21 @@ export default function App() {
                     <div className="w-10 h-5 bg-zinc-800 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-zinc-300 after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-zinc-600"></div>
                   </div>
                 </label>
+
+                {asciiFrames.length > 1 && (
+                  <label className="flex items-center justify-between p-3 bg-zinc-950 rounded-lg border border-zinc-800 cursor-pointer hover:border-zinc-700 transition-colors">
+                    <span className="text-sm text-zinc-400 select-none">Play Animation</span>
+                    <div className="relative inline-block w-10 h-5">
+                      <input 
+                        type="checkbox" 
+                        className="peer sr-only"
+                        checked={isPlaying}
+                        onChange={(e) => setIsPlaying(e.target.checked)}
+                      />
+                      <div className="w-10 h-5 bg-zinc-800 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-zinc-300 after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-green-500"></div>
+                    </div>
+                  </label>
+                )}
               </div>
             </div>
             
@@ -263,6 +481,16 @@ export default function App() {
                      <Download className="w-4 h-4" />
                      JPG
                    </button>
+                   {asciiFrames.length > 1 && (
+                     <button 
+                      onClick={exportAsGif}
+                      disabled={isExporting}
+                      className="flex-1 flex items-center justify-center gap-2 py-2.5 bg-indigo-600 text-white hover:bg-indigo-500 rounded-lg font-medium transition-colors cursor-pointer text-sm disabled:opacity-50 disabled:cursor-wait"
+                     >
+                       <Download className="w-4 h-4" />
+                       {isExporting ? 'Wait...' : 'GIF'}
+                     </button>
+                   )}
                  </div>
                </div>
             )}
